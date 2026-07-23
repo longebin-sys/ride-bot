@@ -1,0 +1,28 @@
+name: Run RideBot
+
+on:
+  schedule:
+    # Runs every 10 minutes (keeps bot alive)
+    - cron: '*/10 * * * *'
+  workflow_dispatch:  # Allows manual run
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          
+      - name: Install dependencies
+        run: npm install
+        
+      - name: Start bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: node index.js
