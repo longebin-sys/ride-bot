@@ -1,0 +1,350 @@
+const db = require('./database');
+
+// ==================== HELPERS ====================
+
+function getDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// ==================== RIDER FUNCTIONS ====================
+
+async function requestRide(bot, chatId, telegramId, pickupLat, pickupLng, pickupAddress, dropoffAddress) {
+  try {
+    let user = db.getUser(telegramId);
+    if (!user) {
+      user = db.createUser({ telegram_id: telegramId, name: 'Rider', type: 'rider' });
+    }
+
+    const ride = db.createRide({
+      rider_id: user.id,
+      rider_telegram: telegramId,
+      pickup_lat: pickupLat,
+      pickup_lng: pickupLng,
+      pickup_address: pickupAddress,
+      dropoff_address: dropoffAddress,
+      status: 'requesting',
+      total_fare: 0,
+      tip_amount: 0,
+      driver_offers: []
+    });
+
+    await bot.sendMessage(chatId, `
+✅ Ride created!
+
+📍 From: ${pickupAddress}
+📍 To: ${dropoffAddress}
+
+💰 How much are you willing to pay?
+Reply: /fare ${ride.id} [amount]
+Minimum: $3.00
+Example: /fare ${ride.id} 10
+    `);
+
+  } catch (error) {
+    console.error('Request ride error:', error);
+    await bot.sendMessage(chatId, '❌ Failed to create ride.');
+  }
+}
+
+async function setFare(bot, chatId, telegramId, rideId, amount) {
+  try {
+    const amountNum = parseFloat(amount);
+    if (isNaN(amountNum) || amountNum < 3) {
+      await bot.sendMessage(chatId, '❌ Minimum fare is $3.00');
+      return;
+    }
+
+    const ride = db.getRide(rideId);
+    if (!ride || ride.status !== 'requesting') {
+      await bot.sendMessage(chatId, '❌ Ride not found.');
+      return;
+    }
+
+    db.updateRide(rideId, { total_fare: amountNum, status: 'searching' });
+
+    await bot.sendMessage(chatId, `
+💰 Fare set to $${amountNum.toFixed(2)}
+🔍 Searching for nearby drivers...
+    `);
+
+    await findAndNotifyDrivers(bot, rideId);
+
+  } catch (error) {
+    console.error('Set fare error:', error);
+    await bot.sendMessage(chatId, '❌ Failed to set fare.');
+  }
+}
+
+async function findAndNotifyDrivers(bot, rideId) {
+  try {
+    const ride = db.getRide(rideId);
+    if (!ride) return;
+
+    const availableDrivers = db.getAvailableDrivers();
+    if (availableDrivers.length === 0) {
+      await bot.sendMessage(ride.rider_telegram, '😕 No drivers available. Try adding a tip: /tip ' + rideId);
+      return;
+    }
+
+    const driversWithDistance = availableDrivers.map(driver => {
+      const distance = getDistance(
+        ride.pickup_lat, ride.pickup_lng,
+        driver.current_lat, driver.current_lng
+      );
+      return { ...driver, distance };
+    }).filter(d => d.distance <= 10).sort((a, b) => a.distance - b.distance);
+
+    if (driversWithDistance.length === 0) {
+      await bot.sendMessage(ride.rider_telegram, '😕 No drivers within 10km. Try adding a tip.');
+      return;
+    }
+
+    const nearbyDrivers = driversWithDistance.slice(0, 5);
+
+    const offers = nearbyDrivers.map(d => ({
+      driver_id: d.id,
+      distance: d.distance,
+      offered_at: new Date().toISOString()
+    }));
+
+    db.updateRide(rideId, { driver_offers: offers });
+
+    for (const driver of nearbyDrivers) {
+      const eta = Math.round(driver.distance * 2);
+      await bot.sendMessage(driver.telegram_id, `
+🚗 NEW RIDE OFFER!
+
+📍 Pickup: ${ride.pickup_address}
+📍 To: ${ride.dropoff_address}
+💰 Fare: $${ride.total_fare.toFixed(2)}
+📏 Distance: ${driver.distance.toFixed(1)} km
+⏱️ ETA: ${eta} min
+
+Accept: /accept ${rideId}
+      `);
+    }
+
+    // Check after 60 seconds
+    setTimeout(async () => {
+      const updated = db.getRide(rideId);
+      if (updated && updated.status === 'searching') {
+        await bot.sendMessage(ride.rider_telegram, `
+😕 No drivers accepted.
+
+Add a tip to attract drivers:
+/tip ${rideId} [amount]
+Example: /tip ${rideId} 5
+        `);
+      }
+    }, 60000);
+
+  } catch (error) {
+    console.error('Find drivers error:', error);
+  }
+}
+
+async function addTip(bot, chatId, telegramId, rideId, amount) {
+  try {
+    const tip = parseFloat(amount);
+    if (isNaN(tip) || tip < 1) {
+      await bot.sendMessage(chatId, '❌ Minimum tip: $1.00');
+      return;
+    }
+
+    const ride = db.getRide(rideId);
+    if (!ride) {
+      await bot.sendMessage(chatId, '❌ Ride not found.');
+      return;
+    }
+
+    const newTotal = (ride.total_fare || 0) + tip;
+    db.updateRide(rideId, { tip_amount: tip, total_fare: newTotal });
+
+    await bot.sendMessage(chatId, `
+💰 Tip added: $${tip.toFixed(2)}
+💰 New total: $${newTotal.toFixed(2)}
+🔍 Searching again...
+    `);
+
+    await findAndNotifyDrivers(bot, rideId);
+
+  } catch (error) {
+    console.error('Tip error:', error);
+    await bot.sendMessage(chatId, '❌ Failed.');
+  }
+}
+
+// ==================== DRIVER FUNCTIONS ====================
+
+async function registerDriver(bot, chatId, telegramId, name, vehicle, plate) {
+  try {
+    let user = db.getUser(telegramId);
+    if (user) {
+      await bot.sendMessage(chatId, '⚠️ Already registered!');
+      return;
+    }
+
+    user = db.createUser({ 
+      telegram_id: telegramId, 
+      name: name, 
+      type: 'driver' 
+    });
+
+    db.createDriver({
+      telegram_id: telegramId,
+      user_id: user.id,
+      name: name,
+      vehicle_name: vehicle,
+      license_plate: plate,
+      status: 'offline',
+      rating: 5.0,
+      total_rides: 0
+    });
+
+    await bot.sendMessage(chatId, `
+✅ Registered!
+Name: ${name}
+Vehicle: ${vehicle}
+Plate: ${plate}
+
+Type /online to start accepting rides.
+    `);
+
+  } catch (error) {
+    console.error('Register error:', error);
+    await bot.sendMessage(chatId, '❌ Registration failed.');
+  }
+}
+
+async function goOnline(bot, chatId, telegramId) {
+  try {
+    const driver = db.getDriver(telegramId);
+    if (!driver) {
+      await bot.sendMessage(chatId, '❌ Register first: /register');
+      return;
+    }
+
+    db.updateDriver(telegramId, { status: 'available' });
+
+    await bot.sendMessage(chatId, `
+✅ You are ONLINE! 🚗
+
+📍 Share your location:
+Tap 📎 → Location → Send
+
+This helps riders find you.
+    `);
+
+  } catch (error) {
+    console.error('Go online error:', error);
+    await bot.sendMessage(chatId, '❌ Failed.');
+  }
+}
+
+async function updateDriverLocation(bot, chatId, telegramId, lat, lng) {
+  try {
+    db.updateDriver(telegramId, { 
+      current_lat: lat, 
+      current_lng: lng,
+      last_location_update: new Date().toISOString()
+    });
+
+    await bot.sendMessage(chatId, '📍 Location updated! You are now visible to riders.');
+  } catch (error) {
+    console.error('Location error:', error);
+    await bot.sendMessage(chatId, '❌ Failed.');
+  }
+}
+
+async function goOffline(bot, chatId, telegramId) {
+  try {
+    db.updateDriver(telegramId, { status: 'offline' });
+    await bot.sendMessage(chatId, '✅ You are OFFLINE.');
+  } catch (error) {
+    await bot.sendMessage(chatId, '❌ Failed.');
+  }
+}
+
+async function acceptRide(bot, chatId, telegramId, rideId) {
+  try {
+    const ride = db.getRide(rideId);
+    if (!ride || ride.status !== 'searching') {
+      await bot.sendMessage(chatId, '❌ Ride not available.');
+      return;
+    }
+
+    const driver = db.getDriver(telegramId);
+    if (!driver) {
+      await bot.sendMessage(chatId, '❌ Driver not found.');
+      return;
+    }
+
+    db.updateRide(rideId, { 
+      driver_id: driver.id, 
+      driver_telegram: telegramId,
+      status: 'accepted' 
+    });
+
+    db.updateDriver(telegramId, { status: 'busy' });
+
+    await bot.sendMessage(chatId, `
+✅ Ride accepted!
+
+📍 ${ride.pickup_address} → ${ride.dropoff_address}
+💰 $${ride.total_fare.toFixed(2)}
+
+Type /pickedup ${rideId} when picked up.
+    `);
+
+  } catch (error) {
+    console.error('Accept error:', error);
+    await bot.sendMessage(chatId, '❌ Failed.');
+  }
+}
+
+async function pickedUp(bot, chatId, telegramId, rideId) {
+  try {
+    db.updateRide(rideId, { status: 'picked_up' });
+    await bot.sendMessage(chatId, '✅ Picked up! Type /done ' + rideId + ' to complete.');
+  } catch (error) {
+    await bot.sendMessage(chatId, '❌ Failed.');
+  }
+}
+
+async function completeRide(bot, chatId, telegramId, rideId) {
+  try {
+    db.updateRide(rideId, { status: 'completed' });
+    
+    const driver = db.getDriver(telegramId);
+    if (driver) {
+      db.updateDriver(telegramId, { 
+        status: 'available', 
+        total_rides: (driver.total_rides || 0) + 1 
+      });
+    }
+
+    await bot.sendMessage(chatId, '✅ Ride completed! Thanks for driving!');
+  } catch (error) {
+    console.error('Complete error:', error);
+    await bot.sendMessage(chatId, '❌ Failed.');
+  }
+}
+
+module.exports = {
+  requestRide,
+  setFare,
+  addTip,
+  registerDriver,
+  goOnline,
+  goOffline,
+  updateDriverLocation,
+  acceptRide,
+  pickedUp,
+  completeRide
+};
